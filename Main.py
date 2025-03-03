@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import yfinance as yf
+from yahooquery import Ticker
 from scipy.stats import norm
 from datetime import datetime, timedelta
 import plotly.graph_objects as go
