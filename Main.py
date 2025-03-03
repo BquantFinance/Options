@@ -1,13 +1,13 @@
-import streamlit as st
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import yfinance as yf
-from yahooquery import Ticker
+import matplotlib.gridspec as gridspec
 from scipy.stats import norm
 from datetime import datetime, timedelta
+from yahooquery import Ticker
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
 
 class OptionsAnalyzer:
     """A class to analyze options strategies with customizable parameters."""
@@ -15,35 +15,110 @@ class OptionsAnalyzer:
     def __init__(self):
         self.strategies = []
         self.underlying_price = None
-        self.ticker = None
-        self.expiration_dates = None
+        self.ticker_symbols = []
+        self.ticker_data = None
+        self.expiration_dates = {}  # Dictionary mapping ticker to expiry dates
+        self.option_chains = {}  # Dictionary mapping (ticker, expiry) to option chain
+        self.current_ticker = None
         self.current_expiry = None
-        self.option_chain = None
-        self.stock_data = None
         self.vol_adjustment = 0.0  # Adjustment to implied volatility in percentage points
     
-    def fetch_ticker_data(self, ticker_symbol):
-        """Fetch ticker data and available option expiration dates."""
-        self.ticker = yf.Ticker(ticker_symbol)
-        self.stock_data = self.ticker.history(period="1d")
-        if len(self.stock_data) == 0:
-            st.error(f"No data found for ticker {ticker_symbol}. Please check the symbol and try again.")
-            return []
-            
-        self.underlying_price = self.stock_data['Close'].iloc[-1]
-        self.expiration_dates = self.ticker.options
-        if len(self.expiration_dates) > 0:
-            self.current_expiry = self.expiration_dates[0]
-            self.option_chain = self.ticker.option_chain(self.current_expiry)
+    def fetch_ticker_data(self, ticker_symbols):
+        """Fetch ticker data and available option expiration dates for multiple tickers."""
+        if isinstance(ticker_symbols, str):
+            ticker_symbols = [ticker_symbols]
+        
+        self.ticker_symbols = ticker_symbols
+        self.ticker_data = Ticker(ticker_symbols)
+        
+        # Get price data
+        price_data = self.ticker_data.price
+        
+        # Handle single vs. multiple tickers
+        if len(ticker_symbols) == 1:
+            symbol = ticker_symbols[0]
+            if symbol in price_data and 'regularMarketPrice' in price_data[symbol]:
+                self.underlying_price = price_data[symbol]['regularMarketPrice']
+                self.current_ticker = symbol
+            else:
+                print(f"Error: Could not get price data for {symbol}")
+                return {}
+        else:
+            # For multiple tickers, just populate the price data
+            self.current_ticker = ticker_symbols[0]  # Default to first ticker
+            if self.current_ticker in price_data and 'regularMarketPrice' in price_data[self.current_ticker]:
+                self.underlying_price = price_data[self.current_ticker]['regularMarketPrice']
+            else:
+                print(f"Error: Could not get price data for {self.current_ticker}")
+                return {}
+        
+        # Get option expiration dates for all tickers
+        self.expiration_dates = {}
+        
+        # Fetch all option chains
+        all_options = self.ticker_data.option_chain
+        
+        for symbol in ticker_symbols:
+            if symbol in all_options and isinstance(all_options[symbol], pd.DataFrame):
+                # Extract unique expiration dates
+                expiry_dates = all_options[symbol]['expiration'].unique()
+                self.expiration_dates[symbol] = sorted([str(expiry.date()) for expiry in pd.to_datetime(expiry_dates, unit='s')])
+                
+                # Process option chains for each expiry
+                for expiry in expiry_dates:
+                    expiry_date = str(pd.Timestamp(expiry, unit='s').date())
+                    mask = all_options[symbol]['expiration'] == expiry
+                    expiry_chain = all_options[symbol][mask].copy()
+                    
+                    # Separate calls and puts
+                    calls = expiry_chain[expiry_chain['optionType'] == 'call'].reset_index(drop=True)
+                    puts = expiry_chain[expiry_chain['optionType'] == 'put'].reset_index(drop=True)
+                    
+                    # Store in dictionary
+                    self.option_chains[(symbol, expiry_date)] = {'calls': calls, 'puts': puts}
+            else:
+                print(f"No option data found for {symbol}")
+                self.expiration_dates[symbol] = []
+        
+        # Set current expiry date for the current ticker if available
+        if self.current_ticker in self.expiration_dates and len(self.expiration_dates[self.current_ticker]) > 0:
+            self.current_expiry = self.expiration_dates[self.current_ticker][0]
+        
         return self.expiration_dates
+    
+    def set_current_ticker(self, ticker):
+        """Set the current ticker for analysis."""
+        if ticker in self.ticker_symbols:
+            self.current_ticker = ticker
+            
+            # Update current price
+            price_data = self.ticker_data.price
+            if ticker in price_data and 'regularMarketPrice' in price_data[ticker]:
+                self.underlying_price = price_data[ticker]['regularMarketPrice']
+            
+            # Set current expiry if available
+            if ticker in self.expiration_dates and len(self.expiration_dates[ticker]) > 0:
+                self.current_expiry = self.expiration_dates[ticker][0]
+            else:
+                self.current_expiry = None
+            
+            return True
+        return False
     
     def set_expiry(self, expiry_date):
         """Set the current expiration date for analysis."""
-        if expiry_date in self.expiration_dates:
+        if self.current_ticker in self.expiration_dates and expiry_date in self.expiration_dates[self.current_ticker]:
             self.current_expiry = expiry_date
-            self.option_chain = self.ticker.option_chain(self.current_expiry)
             return True
         return False
+    
+    def get_current_option_chain(self):
+        """Get the option chain for the current ticker and expiry."""
+        if self.current_ticker and self.current_expiry:
+            key = (self.current_ticker, self.current_expiry)
+            if key in self.option_chains:
+                return self.option_chains[key]
+        return None
     
     def set_vol_adjustment(self, adjustment):
         """Set the volatility adjustment factor."""
@@ -124,19 +199,21 @@ class OptionsAnalyzer:
     
     def add_option(self, strike, option_type, quantity=1, custom_price=None):
         """Add an option to the strategy."""
-        if not self.option_chain:
-            st.error("No option chain loaded. Please fetch ticker data first.")
+        option_chain = self.get_current_option_chain()
+        if not option_chain:
+            print("Error: No option chain loaded. Please fetch ticker data first.")
             return False
         
         # Find the option in the chain
         if option_type.lower() == 'call':
-            options_df = self.option_chain.calls
+            options_df = option_chain['calls']
         else:
-            options_df = self.option_chain.puts
+            options_df = option_chain['puts']
             
         option_row = options_df[options_df['strike'] == strike]
+        
         if option_row.empty:
-            st.error(f"No {option_type} option found with strike {strike}")
+            print(f"Error: No {option_type} option found with strike {strike}")
             return False
         
         # Get option details
@@ -144,7 +221,19 @@ class OptionsAnalyzer:
         
         # Use custom price if provided, otherwise use market price
         price = custom_price if custom_price is not None else option_data['lastPrice']
-        implied_vol = option_data['impliedVolatility']
+        
+        # Get implied volatility, with fallback if it's not available directly
+        if 'impliedVolatility' in option_data:
+            implied_vol = option_data['impliedVolatility']
+        else:
+            # Calculate implied vol from bid/ask if available
+            mid_price = (option_data['bid'] + option_data['ask']) / 2 if 'bid' in option_data and 'ask' in option_data else price
+            days = self.calculate_days_to_expiry()
+            T = days / 365.0
+            r = 0.05  # Risk-free rate
+            
+            # Simple approximation of implied vol (would need an iterative solver for accuracy)
+            implied_vol = 0.3  # Default value
         
         # Create option dictionary
         option = {
@@ -161,7 +250,7 @@ class OptionsAnalyzer:
     def add_stock(self, quantity):
         """Add stock position to the strategy."""
         if not self.underlying_price:
-            st.error("No underlying price. Please fetch ticker data first.")
+            print("Error: No underlying price. Please fetch ticker data first.")
             return False
             
         stock = {
@@ -180,7 +269,7 @@ class OptionsAnalyzer:
     def calculate_payoff(self, price_range=None):
         """Calculate strategy payoff across a range of prices."""
         if not self.underlying_price:
-            st.error("No underlying price. Please fetch ticker data first.")
+            print("Error: No underlying price. Please fetch ticker data first.")
             return None
         
         # Set price range if not provided
@@ -214,12 +303,12 @@ class OptionsAnalyzer:
                             intrinsic = max(0, price - strike)
                         else:  # put
                             intrinsic = max(0, strike - price)
-                        payoff += quantity * (intrinsic - option_price)
+                        payoff += quantity * (intrinsic - option_price) * 100  # 100 shares per contract
                     else:
                         # Before expiration - use Black-Scholes
                         implied_vol = position['impliedVolatility']
                         new_price = self.black_scholes_price(price, strike, T, r, implied_vol, option_type)
-                        payoff += quantity * (new_price - option_price)
+                        payoff += quantity * (new_price - option_price) * 100  # 100 shares per contract
             
             payoffs.append(payoff)
         
@@ -228,7 +317,7 @@ class OptionsAnalyzer:
     def calculate_greeks_profile(self, price_range=None):
         """Calculate greeks across a range of prices."""
         if not self.underlying_price:
-            st.error("No underlying price. Please fetch ticker data first.")
+            print("Error: No underlying price. Please fetch ticker data first.")
             return None
             
         # Set price range if not provided
@@ -264,10 +353,10 @@ class OptionsAnalyzer:
                     
                     greeks = self.calculate_option_greeks(price, strike, T, r, implied_vol, option_type)
                     
-                    delta_profile[i] += quantity * greeks['delta']
-                    gamma_profile[i] += quantity * greeks['gamma']
-                    theta_profile[i] += quantity * greeks['theta']
-                    vega_profile[i] += quantity * greeks['vega']
+                    delta_profile[i] += quantity * greeks['delta'] * 100  # 100 shares per contract
+                    gamma_profile[i] += quantity * greeks['gamma'] * 100
+                    theta_profile[i] += quantity * greeks['theta'] * 100
+                    vega_profile[i] += quantity * greeks['vega'] * 100
         
         return {
             'delta': delta_profile,
@@ -341,18 +430,8 @@ class OptionsAnalyzer:
                 option_count += 1
         
         if option_count == 0:
-            # No options in the strategy, use overall implied volatility
-            if self.option_chain is not None:
-                # Average IV from calls and puts at the money
-                calls_iv = self.option_chain.calls['impliedVolatility']
-                puts_iv = self.option_chain.puts['impliedVolatility']
-                nearest_strike_call = self.option_chain.calls.iloc[(self.option_chain.calls['strike'] - self.underlying_price).abs().argsort()[0]]
-                nearest_strike_put = self.option_chain.puts.iloc[(self.option_chain.puts['strike'] - self.underlying_price).abs().argsort()[0]]
-                avg_iv = (nearest_strike_call['impliedVolatility'] + nearest_strike_put['impliedVolatility']) / 2
-                avg_iv *= (1 + self.vol_adjustment)  # Apply volatility adjustment
-            else:
-                # If no option chain, use a default value
-                avg_iv = 0.3  # Example value
+            # No options in the strategy, use a default value
+            avg_iv = 0.3  # Example value
         else:
             avg_iv = total_iv / option_count
         
@@ -392,11 +471,122 @@ class OptionsAnalyzer:
             total_prob += region_prob
         
         return total_prob * 100  # Return as percentage
-
+    
+    def plot_strategy(self):
+        """Plot the strategy payoff and greeks."""
+        if not self.strategies:
+            print("No strategy defined. Please add positions first.")
+            return
+            
+        # Set up price range for plotting
+        price_min = self.underlying_price * 0.8
+        price_max = self.underlying_price * 1.2
+        price_range = np.linspace(price_min, price_max, 100)
+        
+        # Calculate payoff and greeks
+        payoffs = self.calculate_payoff(price_range)
+        greeks = self.calculate_greeks_profile(price_range)
+        
+        # Create figure with multiple subplots
+        fig = plt.figure(figsize=(15, 10))
+        gs = gridspec.GridSpec(3, 2, height_ratios=[2, 1, 1])
+        
+        # Plot payoff
+        ax_payoff = plt.subplot(gs[0, :])
+        ax_payoff.plot(price_range, payoffs, 'b-', linewidth=2)
+        ax_payoff.axhline(y=0, color='r', linestyle='-', alpha=0.3)
+        ax_payoff.axvline(x=self.underlying_price, color='g', linestyle='--', alpha=0.5)
+        ax_payoff.set_title(f'Strategy Payoff - {self.current_ticker} (Current: ${self.underlying_price:.2f})')
+        ax_payoff.set_xlabel('Underlying Price')
+        ax_payoff.set_ylabel('Profit/Loss ($)')
+        ax_payoff.grid(True)
+        
+        # Highlight breakeven points
+        breakeven_points = self.get_breakeven_points(price_range)
+        for point in breakeven_points:
+            ax_payoff.axvline(x=point, color='purple', linestyle=':', alpha=0.7)
+            ax_payoff.text(point, 0, f'BE: ${point:.2f}', rotation=90, verticalalignment='bottom')
+        
+        # Calculate max profit/loss
+        max_profit, max_loss = self.get_max_profit_loss(price_range)
+        
+        # Add annotations for key metrics
+        metrics_text = f"Max Profit: ${max_profit:.2f}\n"
+        metrics_text += f"Max Loss: ${max_loss:.2f}\n"
+        
+        # Add probability of profit if available
+        prob_profit = self.calculate_probability_profit()
+        if prob_profit is not None:
+            metrics_text += f"Probability of Profit: {prob_profit:.1f}%\n"
+        
+        metrics_text += f"Days to Expiry: {self.calculate_days_to_expiry()}\n"
+        metrics_text += f"IV Adjustment: {self.vol_adjustment * 100:.1f}%"
+        
+        # Add text box with metrics
+        props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+        ax_payoff.text(0.02, 0.98, metrics_text, transform=ax_payoff.transAxes, 
+                       fontsize=10, verticalalignment='top', bbox=props)
+        
+        # Plot delta
+        ax_delta = plt.subplot(gs[1, 0])
+        ax_delta.plot(price_range, greeks['delta'], 'g-')
+        ax_delta.axvline(x=self.underlying_price, color='g', linestyle='--', alpha=0.5)
+        ax_delta.set_title('Delta')
+        ax_delta.set_xlabel('Underlying Price')
+        ax_delta.set_ylabel('Delta')
+        ax_delta.grid(True)
+        
+        # Plot gamma
+        ax_gamma = plt.subplot(gs[1, 1])
+        ax_gamma.plot(price_range, greeks['gamma'], 'm-')
+        ax_gamma.axvline(x=self.underlying_price, color='g', linestyle='--', alpha=0.5)
+        ax_gamma.set_title('Gamma')
+        ax_gamma.set_xlabel('Underlying Price')
+        ax_gamma.set_ylabel('Gamma')
+        ax_gamma.grid(True)
+        
+        # Plot theta
+        ax_theta = plt.subplot(gs[2, 0])
+        ax_theta.plot(price_range, greeks['theta'], 'r-')
+        ax_theta.axvline(x=self.underlying_price, color='g', linestyle='--', alpha=0.5)
+        ax_theta.set_title('Theta (Daily)')
+        ax_theta.set_xlabel('Underlying Price')
+        ax_theta.set_ylabel('Theta')
+        ax_theta.grid(True)
+        
+        # Plot vega
+        ax_vega = plt.subplot(gs[2, 1])
+        ax_vega.plot(price_range, greeks['vega'], 'c-')
+        ax_vega.axvline(x=self.underlying_price, color='g', linestyle='--', alpha=0.5)
+        ax_vega.set_title('Vega')
+        ax_vega.set_xlabel('Underlying Price')
+        ax_vega.set_ylabel('Vega')
+        ax_vega.grid(True)
+        
+        plt.tight_layout()
+        plt.show()
+        
+        # Print strategy summary
+        print("\nStrategy Summary:")
+        total_cost = 0
+        for position in self.strategies:
+            if position['type'] == 'stock':
+                print(f"Stock: {position['quantity']} shares at ${position['price']:.2f}")
+                total_cost += position['quantity'] * position['price']
+            else:
+                print(f"{position['type'].capitalize()}: {position['quantity']} contracts at strike ${position['strike']:.2f}, price ${position['price']:.2f}")
+                total_cost += position['quantity'] * position['price'] * 100  # Assuming standard 100 shares per contract
+        
+        print(f"\nTotal Position Cost: ${total_cost:.2f}")
+        print(f"Max Profit: ${max_profit:.2f}")
+        print(f"Max Loss: ${max_loss:.2f}")
+        if prob_profit is not None:
+            print(f"Probability of Profit: {prob_profit:.1f}%")
+    
     def generate_plotly_charts(self):
         """Generate Plotly charts for strategy analysis."""
         if not self.strategies:
-            st.error("No strategy defined. Please add positions first.")
+            print("No strategy defined. Please add positions first.")
             return None, None
             
         # Set up price range for plotting
@@ -454,7 +644,7 @@ class OptionsAnalyzer:
         
         # Update layout for payoff chart
         payoff_fig.update_layout(
-            title=f'Strategy Payoff - {self.ticker.ticker} (Current: ${self.underlying_price:.2f})',
+            title=f'Strategy Payoff - {self.current_ticker} (Current: ${self.underlying_price:.2f})',
             xaxis_title='Underlying Price',
             yaxis_title='Profit/Loss ($)',
             hovermode='x unified',
@@ -517,219 +707,3 @@ class OptionsAnalyzer:
         greeks_fig.update_xaxes(title_text='Underlying Price', row=2, col=2)
         
         return payoff_fig, greeks_fig
-
-
-def create_streamlit_app():
-    # Set page config
-    st.set_page_config(
-        page_title="Options Strategy Analyzer",
-        page_icon="📊",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
-    
-    # Create analyzer instance
-    analyzer = OptionsAnalyzer()
-    
-    # Page title
-    st.title("🚀 Options Strategy Analyzer")
-    st.markdown("Analyze options strategies with customizable parameters, similar to OptionStrat")
-    
-    # Sidebar for controls
-    st.sidebar.header("Settings")
-    
-    # Ticker input
-    ticker_input = st.sidebar.text_input("Ticker Symbol", value="SPY")
-    fetch_button = st.sidebar.button("Fetch Data", key="fetch_data")
-    
-    # Store analyzer in session state
-    if 'analyzer' not in st.session_state:
-        st.session_state.analyzer = analyzer
-    
-    if 'expiry_dates' not in st.session_state:
-        st.session_state.expiry_dates = []
-        
-    if 'current_strikes' not in st.session_state:
-        st.session_state.current_strikes = {"call": [], "put": []}
-    
-    # Fetch data when button is clicked
-    if fetch_button:
-        with st.spinner(f"Fetching data for {ticker_input}..."):
-            expiry_dates = st.session_state.analyzer.fetch_ticker_data(ticker_input)
-            
-            if expiry_dates:
-                st.session_state.expiry_dates = expiry_dates
-                st.session_state.analyzer.set_expiry(expiry_dates[0])  # Select first expiry by default
-                
-                # Get available strikes
-                calls = st.session_state.analyzer.option_chain.calls['strike'].unique()
-                puts = st.session_state.analyzer.option_chain.puts['strike'].unique()
-                st.session_state.current_strikes = {"call": sorted(calls), "put": sorted(puts)}
-                
-                st.sidebar.success(f"Loaded data for {ticker_input}")
-            else:
-                st.sidebar.error(f"Failed to load data for {ticker_input}")
-    
-    # Only show these controls if we have data
-    if st.session_state.analyzer.underlying_price is not None:
-        st.sidebar.metric("Current Price", f"${st.session_state.analyzer.underlying_price:.2f}")
-        
-        # Expiry selection
-        if len(st.session_state.expiry_dates) > 0:
-            selected_expiry = st.sidebar.selectbox(
-                "Expiration Date",
-                options=st.session_state.expiry_dates,
-                index=0
-            )
-            
-            # Update expiry when changed
-            if selected_expiry != st.session_state.analyzer.current_expiry:
-                st.session_state.analyzer.set_expiry(selected_expiry)
-                
-                # Update available strikes
-                calls = st.session_state.analyzer.option_chain.calls['strike'].unique()
-                puts = st.session_state.analyzer.option_chain.puts['strike'].unique()
-                st.session_state.current_strikes = {"call": sorted(calls), "put": sorted(puts)}
-        
-        # IV adjustment slider
-        vol_adjustment = st.sidebar.slider(
-            "Implied Volatility Adjustment",
-            min_value=-0.5,
-            max_value=0.5,
-            value=0.0,
-            step=0.05,
-            format="%.0f%%",
-            help="Adjust implied volatility by this percentage"
-        )
-        st.session_state.analyzer.set_vol_adjustment(vol_adjustment)
-        
-        # Days to expiry display
-        days = st.session_state.analyzer.calculate_days_to_expiry()
-        st.sidebar.metric("Days to Expiration", days)
-        
-        # Strategy builder section
-        st.sidebar.header("Strategy Builder")
-        
-        # Position type selector
-        position_type = st.sidebar.radio(
-            "Position Type",
-            options=["Call", "Put", "Stock"],
-            index=0
-        )
-        
-        # Controls based on position type
-        if position_type in ["Call", "Put"]:
-            # Option controls
-            
-            # Show available strikes
-            strikes = st.session_state.current_strikes[position_type.lower()]
-            
-            if len(strikes) > 0:
-                # Find ATM strike
-                atm_index = (np.abs(np.array(strikes) - st.session_state.analyzer.underlying_price)).argmin()
-                
-                selected_strike = st.sidebar.selectbox(
-                    "Strike Price",
-                    options=strikes,
-                    index=atm_index
-                )
-                
-                # Option quantity
-                quantity = st.sidebar.number_input(
-                    "Quantity",
-                    min_value=1,
-                    max_value=100,
-                    value=1
-                )
-                
-                # Add option button
-                if st.sidebar.button(f"Add {position_type} Option"):
-                    if st.session_state.analyzer.add_option(selected_strike, position_type.lower(), quantity):
-                        st.sidebar.success(f"Added {quantity} {position_type} option(s) at strike ${selected_strike:.2f}")
-                    else:
-                        st.sidebar.error("Failed to add option")
-            else:
-                st.sidebar.warning(f"No {position_type}s available for selected expiration")
-        else:
-            # Stock controls
-            quantity = st.sidebar.number_input(
-                "Number of Shares",
-                min_value=1,
-                max_value=10000,
-                value=100
-            )
-            
-            # Add stock button
-            if st.sidebar.button("Add Stock Position"):
-                if st.session_state.analyzer.add_stock(quantity):
-                    st.sidebar.success(f"Added {quantity} shares at ${st.session_state.analyzer.underlying_price:.2f}")
-                else:
-                    st.sidebar.error("Failed to add stock position")
-        
-        # Clear strategy button
-        if st.sidebar.button("Clear Strategy", type="secondary"):
-            st.session_state.analyzer.clear_strategy()
-            st.sidebar.info("Strategy cleared")
-        
-        # Main content area
-        if st.session_state.analyzer.strategies:
-            # Display strategy summary
-            st.subheader("Strategy Summary")
-            
-            # Create strategy table
-            strategy_data = []
-            total_cost = 0
-            
-            for position in st.session_state.analyzer.strategies:
-                if position['type'] == 'stock':
-                    position_desc = f"Stock: {position['quantity']} shares"
-                    position_price = f"${position['price']:.2f}/share"
-                    position_cost = position['quantity'] * position['price']
-                else:
-                    position_desc = f"{position['type'].upper()}: {position['quantity']} contract(s) @ ${position['strike']:.2f}"
-                    position_price = f"${position['price']:.2f}/share"
-                    position_cost = position['quantity'] * position['price'] * 100  # 100 shares per contract
-                
-                strategy_data.append({
-                    "Position": position_desc,
-                    "Price": position_price,
-                    "Cost": f"${position_cost:.2f}"
-                })
-                total_cost += position_cost
-            
-            # Show strategy table
-            st.table(pd.DataFrame(strategy_data))
-            
-            # Show total cost
-            st.metric("Total Position Cost", f"${total_cost:.2f}")
-            
-            # Calculate and display key metrics
-            max_profit, max_loss = st.session_state.analyzer.get_max_profit_loss()
-            prob_profit = st.session_state.analyzer.calculate_probability_profit()
-            
-            # Create metrics columns
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("Max Profit", f"${max_profit:.2f}" if max_profit is not None else "N/A")
-            
-            with col2:
-                st.metric("Max Loss", f"${max_loss:.2f}" if max_loss is not None else "N/A")
-            
-            with col3:
-                st.metric("Probability of Profit", f"{prob_profit:.1f}%" if prob_profit is not None else "N/A")
-            
-            # Generate and display charts
-            payoff_chart, greeks_chart = st.session_state.analyzer.generate_plotly_charts()
-            
-            if payoff_chart is not None and greeks_chart is not None:
-                st.plotly_chart(payoff_chart, use_container_width=True)
-                st.plotly_chart(greeks_chart, use_container_width=True)
-            else:
-                st.error("Failed to generate charts")
-        else:
-            st.info("No positions added to strategy yet. Use the sidebar to build your strategy.")
-
-# Create a function to run the app
-if __name__ == '__main__':
-    create_streamlit_app()
