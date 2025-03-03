@@ -5,10 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 import time
-
-# Import the OptionsAnalyzer class
-# Make sure to have the options_analyzer.py file in the same directory
-from options_analyzer import OptionsAnalyzer
+from Main import OptionsAnalyzer
 
 def create_streamlit_app():
     # Set page config
